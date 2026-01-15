@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ครัวมรดก - บันทึกสูตรอาหารออนไลน์ (Firebase Auth)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Anuphan:wght@300;400;600&family=Charm:wght@400;700&display=swap" rel="stylesheet">
+    
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            signInWithEmailAndPassword, 
+            signInWithCustomToken,
+            onAuthStateChanged, 
+            signOut 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            collection, 
+            doc, 
+            setDoc, 
+            deleteDoc, 
+            onSnapshot, 
+            serverTimestamp 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Firebase Configuration ---
+        const firebaseConfig = {
+            apiKey: "AIzaSyBTQ1azb__-9MfdWQF-HdUS_HavihPUT28",
+            authDomain: "heritage-kitchen-d45e7.firebaseapp.com",
+            projectId: "heritage-kitchen-d45e7",
+            storageBucket: "heritage-kitchen-d45e7.firebasestorage.app",
+            messagingSenderId: "116897047617",
+            appId: "1:116897047617:web:cc92bc27022e64354952c0",
+            measurementId: "G-W1WRR3QSBM"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = "heritage-kitchen-d45e7";
+
+        // --- App State ---
+        let recipes = [];
+        let currentCategory = 'ทั้งหมด';
+        let currentUser = null;
+        let pendingView = null;
+        let sliderIndex = 0;
+        const categories = ['ทั้งหมด', 'กับข้าว', 'อาหารจานเดียว', 'ของหวาน', 'เครื่องดื่ม'];
+
+        // --- UI Helper ---
+        const updateCloudStatus = (status) => {
+            const el = document.getElementById('cloud-status');
+            if (!el) return;
+            if (status === 'connected') {
+                const isOwner = currentUser && !currentUser.isAnonymous;
+                el.innerHTML = `<span class="flex items-center gap-1.5 ${isOwner ? 'text-blue-600' : 'text-green-600'}">
+                    <span class="w-2 h-2 ${isOwner ? 'bg-blue-500' : 'bg-green-500'} rounded-full animate-pulse"></span> 
+                    ${isOwner ? `เจ้าของ: ${currentUser.email}` : 'โหมดอ่านอย่างเดียว'}
+                </span>`;
+            } else if (status === 'connecting') {
+                el.innerHTML = '<span class="flex items-center gap-1.5 text-orange-400"><span class="w-2 h-2 bg-orange-300 rounded-full animate-bounce"></span> กำลังตรวจสอบสิทธิ์...</span>';
+            } else {
+                el.innerHTML = '<span class="flex items-center gap-1.5 text-red-500">❌ ตรวจสอบการเชื่อมต่อ</span>';
+            }
+        };
+
+        // --- AUTHENTICATION LOGIC ---
+        const initAuth = async () => {
+            updateCloudStatus('connecting');
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    try {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } catch (tokenError) {
+                        await signInAnonymously(auth);
+                    }
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Authentication failed:", error);
+                updateCloudStatus('error');
+            }
+        };
+
+        onAuthStateChanged(auth, (user) => {
+            currentUser = user;
+            if (user) {
+                updateCloudStatus('connected');
+                setupRealtimeSync();
+                if (!user.isAnonymous && pendingView) {
+                    showView(pendingView.view, pendingView.data);
+                    pendingView = null;
+                }
+            }
+            renderNavButtons();
+        });
+
+        const setupRealtimeSync = () => {
+            const recipesRef = collection(db, 'artifacts', appId, 'public', 'data', 'recipes');
+            onSnapshot(recipesRef, (snapshot) => {
+                recipes = snapshot.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data(),
+                    createdAt: doc.data().createdAt?.toDate() || new Date()
+                }));
+                recipes.sort((a, b) => b.createdAt - a.createdAt);
+                showView(window.currentViewName || 'home', window.currentViewData);
+            }, (err) => {
+                console.error("Sync error:", err);
+                updateCloudStatus('error');
+            });
+        };
+
+        // --- NAVIGATION ---
+        window.showView = (view, data = null) => {
+            const content = document.getElementById('app-content');
+            window.currentViewName = view;
+            window.currentViewData = data;
+            window.scrollTo(0, 0);
+
+            const isOwner = currentUser && !currentUser.isAnonymous;
+
+            if ((view === 'add' || view === 'edit') && !isOwner) {
+                pendingView = { view, data };
+                renderLogin(content);
+                return;
+            }
+
+            if (view === 'home') renderHome(content);
+            else if (view === 'add' || view === 'edit') renderForm(content, data);
+            else if (view === 'detail') renderDetail(content, data);
+            else if (view === 'login') renderLogin(content);
+        };
+
+        const handleLogout = async () => {
+            try {
+                await signOut(auth);
+                window.location.reload(); 
+            } catch (error) {
+                showNotification("Logout ไม่สำเร็จ", "error");
+            }
+        };
+
+        // --- COMPONENTS ---
+        const renderNavButtons = () => {
+            const navContainer = document.getElementById('nav-actions');
+            const isOwner = currentUser && !currentUser.isAnonymous;
+            
+            navContainer.innerHTML = isOwner ? `
+                <div class="flex items-center gap-3">
+                    <button onclick="showView('add')" class="bg-orange-600 hover:bg-orange-700 text-white px-5 py-2.5 rounded-2xl font-black text-xs uppercase tracking-widest flex items-center gap-2 transition-all shadow-lg active:scale-95">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4" /></svg>
+                        เพิ่มสูตร
+                    </button>
+                    <button onclick="window.handleLogout()" class="text-gray-400 hover:text-red-500 p-2 transition-all" title="ออกจากระบบ">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
+                    </button>
+                </div>
+            ` : `
+                <button onclick="showView('login')" class="bg-white border border-orange-100 text-orange-900 px-6 py-2.5 rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-orange-50 transition-all shadow-sm">
+                    Owner Login
+                </button>
+            `;
+        };
+
+        const renderLogin = (container) => {
+            container.innerHTML = `
+                <div class="max-w-md mx-auto bg-white rounded-[2.5rem] shadow-2xl p-10 border border-orange-50 mt-10 animate-in fade-in zoom-in duration-300">
+                    <div class="text-center mb-10">
+                        <div class="text-5xl mb-4">👨‍🍳</div>
+                        <h2 class="text-2xl font-bold text-orange-950">ยินดีต้อนรับ เจ้าของตำรา</h2>
+                        <p class="text-gray-500 text-sm mt-2">กรุณาเข้าสู่ระบบเพื่อจัดการข้อมูล</p>
+                    </div>
+                    <form id="login-form" class="space-y-4">
+                        <div class="space-y-2">
+                            <label class="text-[10px] font-black text-orange-900 uppercase tracking-widest ml-1">Email Address</label>
+                            <input type="email" id="login-email" required
+                                class="w-full px-6 py-4 rounded-2xl bg-orange-50/50 border-2 border-transparent focus:bg-white focus:border-orange-500 outline-none transition-all font-semibold" 
+                                placeholder="name@example.com">
+                        </div>
+                        <div class="space-y-2">
+                            <label class="text-[10px] font-black text-orange-900 uppercase tracking-widest ml-1">Password</label>
+                            <input type="password" id="login-password" required
+                                class="w-full px-6 py-4 rounded-2xl bg-orange-50/50 border-2 border-transparent focus:bg-white focus:border-orange-500 outline-none transition-all" 
+                                placeholder="••••••••">
+                        </div>
+                        <div id="login-error" class="text-red-500 text-xs text-center font-bold hidden py-2 bg-red-50 rounded-lg">อีเมลหรือรหัสผ่านไม่ถูกต้อง</div>
+                        <button type="submit" id="login-btn" class="w-full bg-orange-900 text-white font-black py-4 rounded-2xl hover:bg-black shadow-lg transition-all active:scale-95 uppercase tracking-widest mt-4">
+                            Login
+                        </button>
+                        <button type="button" onclick="showView('home')" class="w-full text-gray-400 font-bold text-[10px] uppercase tracking-widest hover:text-gray-600 transition pt-2">
+                            กลับหน้าหลัก (โหมดอ่านอย่างเดียว)
+                        </button>
+                    </form>
+                </div>
+            `;
+
+            document.getElementById('login-form').onsubmit = async (e) => {
+                e.preventDefault();
+                const email = document.getElementById('login-email').value;
+                const pass = document.getElementById('login-password').value;
+                const btn = document.getElementById('login-btn');
+                const errorEl = document.getElementById('login-error');
+
+                btn.disabled = true;
+                btn.innerHTML = "Logging in...";
+                errorEl.classList.add('hidden');
+
+                try {
+                    await signInWithEmailAndPassword(auth, email, pass);
+                    showNotification("เข้าสู่ระบบสำเร็จ", "success");
+                } catch (error) {
+                    console.error(error);
+                    errorEl.classList.remove('hidden');
+                    btn.disabled = false;
+                    btn.innerHTML = "Login";
+                }
+            };
+        };
+
+        const renderHome = (container) => {
+            const filteredRecipes = currentCategory === 'ทั้งหมด' ? recipes : recipes.filter(r => r.category === currentCategory);
+            const featuredRecipes = recipes.slice(0, 5); 
+
+            container.innerHTML = `
+                <div class="mb-8 flex flex-col md:flex-row md:items-end justify-between gap-4">
+                    <div>
+                        <h2 class="text-2xl font-bold text-orange-900 mb-1">ตำรามรดก</h2>
+                        <p class="text-gray-500 text-sm italic font-light">"เพราะรสชาติคือความทรงจำที่กินได้"</p>
+                    </div>
+                    <div id="cloud-status" class="text-[10px] font-bold bg-white px-4 py-2 rounded-full shadow-sm border border-gray-100 uppercase tracking-widest"></div>
+                </div>
+
+                <!-- Slider / Carousel -->
+                ${featuredRecipes.length > 0 ? `
+                    <div class="relative overflow-hidden rounded-[2.5rem] bg-orange-100/30 mb-12 shadow-inner group">
+                        <div id="recipe-slider" class="flex transition-transform duration-700 ease-in-out" style="transform: translateX(-${sliderIndex * 100}%)">
+                            ${featuredRecipes.map(r => `
+                                <div class="w-full flex-shrink-0 flex flex-col md:flex-row items-center p-8 md:p-12 gap-8 cursor-pointer" onclick="showView('detail', '${r.id}')">
+                                    <div class="w-32 h-32 md:w-52 md:h-52 bg-white rounded-[2rem] flex items-center justify-center overflow-hidden shadow-xl border-4 border-orange-50">
+                                        ${r.image ? `<img src="${r.image}" class="w-full h-full object-cover">` : `<span class="text-7xl">${getEmoji(r.category)}</span>`}
+                                    </div>
+                                    <div class="flex-grow text-center md:text-left">
+                                        <span class="inline-block bg-orange-600 text-white text-[9px] font-black px-3 py-1 rounded-full mb-3 uppercase tracking-widest shadow-sm">แนะนำ</span>
+                                        <h3 class="text-2xl md:text-3xl font-brand font-bold text-orange-950 mb-2 tracking-wide">${r.title}</h3>
+                                        <p class="text-gray-500 italic line-clamp-2 max-w-xl text-sm mb-4">"${r.story || 'ตำรับลับที่รอการพิสูจน์รสชาติ'}"</p>
+                                        <div class="flex items-center justify-center md:justify-start gap-4 text-[10px] font-bold text-orange-800 tracking-widest uppercase">
+                                            <span>${r.category}</span>
+                                            <span class="w-1 h-1 bg-orange-300 rounded-full"></span>
+                                            <span>${r.createdAt.toLocaleDateString('th-TH')}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                        
+                        <!-- Navigation Arrows -->
+                        <button onclick="window.moveSlider(-1, event)" class="absolute left-4 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-white/80 backdrop-blur shadow-md flex items-center justify-center text-orange-950 opacity-0 group-hover:opacity-100 transition-opacity z-10">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7" /></svg>
+                        </button>
+                        <button onclick="window.moveSlider(1, event)" class="absolute right-4 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-white/80 backdrop-blur shadow-md flex items-center justify-center text-orange-950 opacity-0 group-hover:opacity-100 transition-opacity z-10">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" /></svg>
+                        </button>
+
+                        <div class="absolute bottom-6 left-1/2 -translate-x-1/2 flex gap-2">
+                            ${featuredRecipes.map((_, i) => `
+                                <div class="w-2 h-2 rounded-full transition-all duration-300 ${sliderIndex === i ? 'w-6 bg-orange-600' : 'bg-orange-200'}"></div>
+                            `).join('')}
+                        </div>
+                    </div>
+                ` : ''}
+
+                <div class="flex gap-2 overflow-x-auto pb-4 hide-scrollbar mb-8">
+                    ${categories.map(cat => `
+                        <button onclick="window.setCategory('${cat}')" class="px-6 py-2.5 rounded-full whitespace-nowrap border transition-all font-semibold ${currentCategory === cat ? 'bg-orange-600 text-white border-orange-600 shadow-lg scale-105' : 'bg-white text-gray-500 border-gray-200 hover:border-orange-300'}">${cat}</button>
+                    `).join('')}
+                </div>
+
+                ${filteredRecipes.length === 0 ? `
+                    <div class="text-center py-24 bg-white rounded-[3rem] border-2 border-dashed border-orange-100/50">
+                        <div class="text-7xl mb-6">📖</div>
+                        <h3 class="text-xl font-bold text-gray-700 mb-2">ยังไม่มีสูตรอาหารในหน้านี้</h3>
+                        <p class="text-gray-400 mb-8 max-w-xs mx-auto text-sm">เริ่มสร้างตำราประจำตระกูลของคุณได้ง่ายๆ เพียงกดปุ่มเพิ่มสูตร</p>
+                        ${currentUser && !currentUser.isAnonymous ? `<button onclick="showView('add')" class="bg-orange-600 text-white px-10 py-4 rounded-2xl font-black text-sm uppercase tracking-widest shadow-xl hover:bg-orange-700 transition">เขียนสูตรแรก</button>` : ''}
+                    </div>
+                ` : `
+                    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
+                        ${filteredRecipes.map(r => `
+                            <div class="group bg-white rounded-[2rem] shadow-sm hover:shadow-2xl border border-orange-50 overflow-hidden transition-all duration-500 cursor-pointer flex flex-col" onclick="showView('detail', '${r.id}')">
+                                <div class="h-56 bg-orange-50/50 flex items-center justify-center relative overflow-hidden">
+                                    ${r.image ? 
+                                        `<img src="${r.image}" class="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700">` : 
+                                        `<span class="text-7xl group-hover:scale-125 transition-transform duration-700">${getEmoji(r.category)}</span>`
+                                    }
+                                    <div class="absolute top-4 right-4 bg-white/95 backdrop-blur px-3 py-1 rounded-full text-[9px] font-black text-orange-800 shadow-sm border border-orange-100 uppercase tracking-widest z-10">${r.category}</div>
+                                </div>
+                                <div class="p-8 flex-grow flex flex-col">
+                                    <h3 class="text-lg font-bold mb-3 text-orange-950 line-clamp-1 group-hover:text-orange-600 transition-colors">${r.title}</h3>
+                                    <p class="text-gray-400 line-clamp-2 text-sm mb-8 italic font-light leading-relaxed">${r.story || 'ตำรับลับที่รอการพิสูจน์รสชาติ'}</p>
+                                    <div class="mt-auto flex justify-between items-center text-[9px] font-bold text-gray-300 uppercase tracking-[0.2em] pt-5 border-t border-gray-50">
+                                        <span>BY OWNER</span>
+                                        <span>${r.createdAt.toLocaleDateString('th-TH')}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                `}
+            `;
+        };
+
+        const renderForm = (container, recipeId = null) => {
+            const recipe = recipeId ? recipes.find(r => r.id === recipeId) : null;
+            let currentImageBase64 = recipe ? recipe.image : null;
+
+            container.innerHTML = `
+                <div class="max-w-3xl mx-auto bg-white rounded-[3rem] shadow-2xl p-8 md:p-14 border border-orange-50 animate-in fade-in slide-in-from-bottom-6 duration-500">
+                    <div class="flex justify-between items-center mb-10">
+                        <div>
+                            <h2 class="text-2xl font-bold text-orange-950 font-brand">${recipe ? 'แก้ไขตำรับมรดก' : 'เขียนตำราใหม่'}</h2>
+                            <p class="text-[10px] text-gray-400 mt-1 uppercase tracking-widest">Editor: ${currentUser.email}</p>
+                        </div>
+                        <button onclick="showView('home')" class="p-3 hover:bg-orange-50 rounded-2xl transition text-gray-400"><svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg></button>
+                    </div>
+
+                    <form id="recipe-form" class="space-y-10">
+                        <!-- Image Upload Section -->
+                        <div class="space-y-4">
+                            <label class="text-[10px] font-black text-orange-900 uppercase tracking-[0.2em] ml-1">รูปเมนูอาหาร</label>
+                            <div class="flex flex-col items-center gap-6 p-8 border-2 border-dashed border-orange-100 rounded-[2rem] bg-orange-50/20">
+                                <div id="image-preview-container" class="w-40 h-40 md:w-56 md:h-56 bg-white rounded-3xl overflow-hidden shadow-lg border-4 border-white flex items-center justify-center relative group">
+                                    ${currentImageBase64 ? 
+                                        `<img src="${currentImageBase64}" id="preview-img" class="w-full h-full object-cover">` : 
+                                        `<div id="placeholder-preview" class="text-orange-200 text-6xl">📸</div>`
+                                    }
+                                </div>
+                                <div class="text-center">
+                                    <label class="bg-orange-100 hover:bg-orange-200 text-orange-800 px-6 py-2.5 rounded-full font-bold text-xs cursor-pointer transition-all inline-block shadow-sm">
+                                        เลือกรูปจากเครื่อง
+                                        <input type="file" id="image-input" accept="image/*" class="hidden">
+                                    </label>
+                                    <p class="text-[9px] text-gray-400 mt-3 uppercase tracking-wider">แนะนำรูปทรงจัตุรัสเพื่อให้แสดงผลได้ดีที่สุด</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-10">
+                            <div class="space-y-3">
+                                <label class="text-[10px] font-black text-orange-900 uppercase tracking-[0.2em] ml-1">ชื่อเมนูมรดก *</label>
+                                <input type="text" id="form-title" required value="${recipe ? recipe.title : ''}" class="w-full px-6 py-5 rounded-[1.5rem] bg-orange-50/30 border-2 border-transparent focus:bg-white focus:border-orange-500 outline-none transition-all text-xl font-bold text-orange-950" placeholder="เช่น กะเพราโบราณ">
+                            </div>
+                            <div class="space-y-3">
+                                <label class="text-[10px] font-black text-orange-900 uppercase tracking-[0.2em] ml-1">ประเภทอาหาร</label>
+                                <select id="form-category" class="w-full px-6 py-5 rounded-[1.5rem] bg-orange-50/30 border-2 border-transparent focus:bg-white focus:border-orange-500 outline-none transition-all font-bold text-orange-800">
+                                    ${categories.filter(c => c !== 'ทั้งหมด').map(c => `<option value="${c}" ${recipe?.category === c ? 'selected' : ''}>${c}</option>`).join('')}
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="space-y-3">
+                            <label class="text-[10px] font-black text-orange-900 uppercase tracking-[0.2em] ml-1">เรื่องราวเบื้องหลังรสชาติ</label>
+                            <textarea id="form-story" rows="2" class="w-full px-6 py-5 rounded-[1.5rem] bg-orange-50/30 border-2 border-transparent focus:bg-white focus:border-orange-500 outline-none transition-all font-light italic text-gray-600" placeholder="ความทรงจำเกี่ยวกับเมนูนี้...">${recipe ? recipe.story : ''}</textarea>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-10">
+                            <div class="space-y-3">
+                                <label class="text-[10px] font-black text-orange-900 uppercase tracking-[0.2em] ml-1">วัตถุดิบ (บรรทัดละอย่าง) *</label>
+                                <textarea id="form-ingredients" required rows="8" class="w-full px-6 py-5 rounded-[1.5rem] bg-orange-50/30 border-2 border-transparent focus:bg-white focus:border-orange-500 outline-none transition-all text-sm leading-relaxed" placeholder="ไก่สับ 200 กรัม\nพริกขี้หนู 10 เม็ด">${recipe ? recipe.ingredients.join('\n') : ''}</textarea>
+                            </div>
+                            <div class="space-y-3">
+                                <label class="text-[10px] font-black text-orange-900 uppercase tracking-[0.2em] ml-1">ขั้นตอนอย่างละเอียด *</label>
+                                <textarea id="form-steps" required rows="8" class="w-full px-6 py-5 rounded-[1.5rem] bg-orange-50/30 border-2 border-transparent focus:bg-white focus:border-orange-500 outline-none transition-all text-sm leading-relaxed" placeholder="1. เตรียมเครื่องแกง...">${recipe ? recipe.steps.join('\n') : ''}</textarea>
+                            </div>
+                        </div>
+
+                        <div class="pt-6">
+                            <button type="submit" id="submit-btn" class="w-full bg-orange-600 text-white font-black py-6 rounded-[2rem] hover:bg-orange-700 shadow-2xl shadow-orange-100 active:scale-[0.98] transition-all text-lg uppercase tracking-[0.3em]">
+                                บันทึกเข้าคลาวด์
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            `;
+
+            // Handling Image Preview & Storage
+            const imageInput = document.getElementById('image-input');
+            const previewContainer = document.getElementById('image-preview-container');
+
+            imageInput.onchange = (e) => {
+                const file = e.target.files[0];
+                if (file) {
+                    if (file.size > 800000) { // Firebase Doc limit is 1MB total. Keep images small.
+                        showNotification("ไฟล์มีขนาดใหญ่เกินไป กรุณาเลือกไฟล์ที่เล็กกว่า 800KB", "error");
+                        imageInput.value = "";
+                        return;
+                    }
+                    const reader = new FileReader();
+                    reader.onload = (event) => {
+                        currentImageBase64 = event.target.result;
+                        previewContainer.innerHTML = `<img src="${currentImageBase64}" id="preview-img" class="w-full h-full object-cover animate-in fade-in duration-500">`;
+                    };
+                    reader.readAsDataURL(file);
+                }
+            };
+
+            const form = document.getElementById('recipe-form');
+            form.onsubmit = async (e) => {
+                e.preventDefault();
+                const btn = document.getElementById('submit-btn');
+                btn.disabled = true;
+                btn.innerHTML = "Saving to cloud...";
+                
+                await handleFormSubmit(e, recipeId, currentImageBase64);
+            };
+        };
+
+        const renderDetail = (container, recipeId) => {
+            const recipe = recipes.find(r => r.id === recipeId);
+            if (!recipe) return showView('home');
+            const isOwner = currentUser && !currentUser.isAnonymous;
+
+            container.innerHTML = `
+                <div class="max-w-4xl mx-auto mb-10 animate-in fade-in duration-500">
+                    <button onclick="showView('home')" class="flex items-center gap-3 text-orange-800 font-black text-[10px] uppercase tracking-[0.3em] mb-8 hover:gap-5 transition-all">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="4"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7" /></svg>
+                        Back to Library
+                    </button>
+
+                    <div class="bg-white rounded-[4rem] shadow-2xl overflow-hidden border border-orange-50">
+                        <div class="bg-orange-50/50 p-10 md:p-16 text-center relative overflow-hidden flex flex-col items-center">
+                            <div class="absolute inset-0 opacity-[0.05] pointer-events-none">
+                                ${recipe.image ? `<img src="${recipe.image}" class="w-full h-full object-cover blur-3xl scale-150">` : ''}
+                            </div>
+                            
+                            <div class="w-32 h-32 md:w-56 md:h-56 bg-white rounded-[2.5rem] shadow-2xl border-8 border-white overflow-hidden mb-8 relative z-10 flex items-center justify-center">
+                                ${recipe.image ? 
+                                    `<img src="${recipe.image}" class="w-full h-full object-cover">` : 
+                                    `<span class="text-8xl">${getEmoji(recipe.category)}</span>`
+                                }
+                            </div>
+
+                            <span class="inline-block bg-white px-5 py-1.5 rounded-full text-orange-700 text-[9px] font-black mb-6 shadow-sm tracking-[0.4em] uppercase relative z-10">${recipe.category}</span>
+                            <h2 class="text-3xl md:text-5xl font-brand font-bold text-orange-950 mb-8 leading-tight relative z-10 tracking-wide">${recipe.title}</h2>
+                            <div class="flex justify-center items-center gap-8 text-[9px] font-black text-gray-300 uppercase tracking-[0.3em] relative z-10">
+                                <span class="flex items-center gap-2">📅 ${recipe.createdAt.toLocaleDateString('th-TH')}</span>
+                                <span class="w-1.5 h-1.5 bg-orange-200 rounded-full"></span>
+                                <span class="flex items-center gap-2">🔐 OWNER CONTENT</span>
+                            </div>
+                        </div>
+
+                        <div class="p-10 md:p-16 space-y-20">
+                            ${recipe.story ? `
+                                <div class="max-w-2xl mx-auto text-center relative group">
+                                    <div class="text-6xl text-orange-100 font-serif absolute -top-10 left-0 select-none">“</div>
+                                    <p class="text-xl italic text-gray-600 leading-relaxed font-light px-10 relative z-10">${recipe.story}</p>
+                                    <div class="text-6xl text-orange-100 font-serif absolute -bottom-14 right-0 select-none">”</div>
+                                </div>
+                            ` : ''}
+
+                            <div class="grid grid-cols-1 lg:grid-cols-12 gap-16">
+                                <div class="lg:col-span-5 bg-orange-50/30 p-8 rounded-[2.5rem] border border-orange-100/30 h-fit">
+                                    <h3 class="text-[10px] font-black mb-8 text-orange-900 flex items-center gap-3 border-b-2 border-orange-200 pb-3 tracking-[0.3em] uppercase">Ingredients</h3>
+                                    <ul class="space-y-5">
+                                        ${recipe.ingredients.map(ing => `<li class="text-gray-700 flex items-start gap-4 text-base font-medium leading-tight"><div class="mt-2 w-1.5 h-1.5 rounded-full bg-orange-400 flex-shrink-0 shadow-sm"></div> ${ing}</li>`).join('')}
+                                    </ul>
+                                </div>
+                                <div class="lg:col-span-7">
+                                    <h3 class="text-[10px] font-black mb-10 text-orange-900 flex items-center gap-3 border-b-2 border-orange-200 pb-3 tracking-[0.3em] uppercase">Instructions</h3>
+                                    <div class="space-y-10">
+                                        ${recipe.steps.map((step, i) => `
+                                            <div class="flex gap-8 group">
+                                                <div class="flex-shrink-0 w-12 h-12 bg-orange-100 text-orange-700 rounded-2xl flex items-center justify-center font-black text-xl group-hover:bg-orange-600 group-hover:text-white transition-all duration-700 shadow-sm">${i+1}</div>
+                                                <p class="text-xl text-gray-700 pt-1.5 leading-relaxed font-light">${step}</p>
+                                            </div>
+                                        `).join('')}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="bg-gray-50/80 backdrop-blur-md px-10 py-8 flex justify-between items-center border-t border-gray-100">
+                            ${isOwner ? `
+                                <button onclick="handleDeleteRequest('${recipe.id}')" class="text-red-400 hover:text-red-600 text-[9px] font-black uppercase tracking-[0.4em] transition-all">Destroy Data</button>
+                                <button onclick="showView('edit', '${recipe.id}')" class="bg-orange-950 text-white px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-[0.3em] hover:bg-black transition-all shadow-xl active:scale-95">Edit Recipe</button>
+                            ` : `
+                                <div class="text-[9px] font-black text-gray-300 uppercase tracking-widest">Read Only Mode</div>
+                                <button onclick="showView('login')" class="text-orange-600 font-black text-[9px] uppercase tracking-widest hover:underline">Log in to edit</button>
+                            `}
+                        </div>
+                    </div>
+                </div>
+            `;
+        };
+
+        // --- CRUD LOGIC ---
+        const handleFormSubmit = async (event, recipeId, imageBase64 = null) => {
+            if (!currentUser || currentUser.isAnonymous) return;
+            
+            const recipeData = {
+                title: document.getElementById('form-title').value,
+                category: document.getElementById('form-category').value,
+                story: document.getElementById('form-story').value,
+                ingredients: document.getElementById('form-ingredients').value.split('\n').filter(i => i.trim() !== ''),
+                steps: document.getElementById('form-steps').value.split('\n').filter(s => s.trim() !== ''),
+                image: imageBase64,
+                updatedAt: serverTimestamp()
+            };
+
+            try {
+                const id = recipeId && recipeId !== 'null' ? recipeId : Date.now().toString();
+                if (!recipeId || recipeId === 'null') {
+                    recipeData.createdAt = serverTimestamp();
+                }
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'recipes', id);
+                await setDoc(docRef, recipeData, { merge: true });
+                showNotification("บันทึกสำเร็จลงคลาวด์เรียบร้อย", "success");
+                showView('home');
+            } catch (error) { 
+                console.error(error);
+                showNotification("บันทึกไม่สำเร็จ!", "error"); 
+            }
+        };
+
+        window.moveSlider = (dir, event) => {
+            if (event) event.stopPropagation();
+            const featuredRecipes = recipes.slice(0, 5);
+            if (featuredRecipes.length === 0) return;
+            
+            sliderIndex += dir;
+            if (sliderIndex < 0) sliderIndex = featuredRecipes.length - 1;
+            if (sliderIndex >= featuredRecipes.length) sliderIndex = 0;
+            
+            showView('home');
+        };
+
+        window.handleDeleteRequest = (id) => {
+            const modal = document.getElementById('custom-confirm');
+            modal.classList.remove('hidden');
+            window.targetId = id;
+        };
+
+        window.confirmDelete = async () => {
+            if (!currentUser || currentUser.isAnonymous || !window.targetId) return;
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'recipes', window.targetId);
+                await deleteDoc(docRef);
+                window.cancelDelete();
+                showNotification("ลบสูตรเรียบร้อย", "success");
+                showView('home');
+            } catch (error) { 
+                showNotification("ลบไม่สำเร็จ", "error"); 
+            }
+        };
+
+        const showNotification = (msg, type) => {
+            const toast = document.createElement('div');
+            toast.className = `fixed bottom-10 left-1/2 -translate-x-1/2 px-10 py-5 rounded-[2rem] text-white font-black text-xs uppercase tracking-widest shadow-[0_20px_50px_rgba(0,0,0,0.2)] z-[100] animate-in slide-in-from-bottom-12 ${type === 'error' ? 'bg-red-500' : 'bg-orange-600'}`;
+            toast.textContent = msg;
+            document.body.appendChild(toast);
+            setTimeout(() => { toast.classList.add('animate-out', 'fade-out'); setTimeout(() => toast.remove(), 500); }, 3000);
+        };
+
+        // --- UTILS ---
+        const getEmoji = (cat) => {
+            const map = { 'กับข้าว': '🍲', 'อาหารจานเดียว': '🍱', 'ของหวาน': '🍰', 'เครื่องดื่ม': '🥤', 'ทั้งหมด': '🍽️' };
+            return map[cat] || '🥘';
+        };
+
+        window.setCategory = (cat) => { currentCategory = cat; showView('home'); };
+        window.resetAndHome = () => { currentCategory = 'ทั้งหมด'; showView('home'); };
+        window.cancelDelete = () => document.getElementById('custom-confirm').classList.add('hidden');
+        window.handleLogout = handleLogout;
+
+        initAuth();
+    </script>
+
+    <style>
+        body { font-family: 'Anuphan', sans-serif; background-color: #fcf9f5; }
+        .font-brand { font-family: 'Charm', cursive; }
+        .hide-scrollbar::-webkit-scrollbar { display: none; }
+        .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+        .animate-in { animation: fade-in 0.5s ease-out; }
+    </style>
+</head>
+<body class="text-gray-800">
+
+    <nav class="bg-white/80 backdrop-blur-xl border-b border-orange-50 sticky top-0 z-50">
+        <div class="max-w-6xl mx-auto px-8 py-5 flex justify-between items-center">
+            <h1 class="text-3xl font-brand font-bold text-orange-950 cursor-pointer hover:scale-105 transition-transform" onclick="resetAndHome()">ครัวมรดก</h1>
+            <div id="nav-actions"></div>
+        </div>
+    </nav>
+
+    <main id="app-content" class="max-w-6xl mx-auto px-8 py-12 min-h-screen">
+        <div class="flex flex-col items-center justify-center py-48 space-y-8">
+            <div class="w-20 h-20 border-8 border-orange-100 border-t-orange-600 rounded-full animate-spin"></div>
+            <p class="text-orange-900 font-black text-xs uppercase tracking-[0.5em] animate-pulse">Establishing Connection...</p>
+        </div>
+    </main>
+
+    <!-- Custom Confirm Modal -->
+    <div id="custom-confirm" class="fixed inset-0 bg-orange-950/30 backdrop-blur-xl z-[100] flex items-center justify-center hidden p-8">
+        <div class="bg-white p-12 rounded-[4rem] shadow-2xl max-w-sm w-full border border-orange-50 text-center">
+            <div class="text-6xl mb-8">🗑️</div>
+            <h3 class="text-2xl font-bold text-orange-950 mb-4 tracking-tight">Delete Forever?</h3>
+            <p class="text-gray-400 mb-12 leading-relaxed font-light text-sm">การลบข้อมูลนี้จะส่งผลต่อฐานข้อมูลบนคลาวด์ถาวร และไม่สามารถกู้คืนได้</p>
+            <div class="flex gap-4">
+                <button onclick="cancelDelete()" class="flex-1 py-5 font-black text-gray-400 hover:bg-gray-50 rounded-3xl transition uppercase text-[10px] tracking-widest">Cancel</button>
+                <button onclick="confirmDelete()" class="flex-1 py-5 font-black bg-red-500 text-white rounded-3xl hover:bg-red-600 shadow-xl transition uppercase text-[10px] tracking-widest">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
